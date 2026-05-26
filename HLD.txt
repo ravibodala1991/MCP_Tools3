@@ -1,0 +1,241 @@
+================================================================================
+  HIGH-LEVEL DESIGN (HLD) - Document Intelligence MCP Solution
+================================================================================
+
+--------------------------------------------------------------------------------
+  OVERVIEW
+--------------------------------------------------------------------------------
+An AI-powered document intelligence system where a LangGraph Agent automatically
+decides which MCP Tool to call based on what the user asks. All infrastructure
+runs on AWS and is provisioned via CDK.
+
+--------------------------------------------------------------------------------
+  ARCHITECTURE DIAGRAM
+--------------------------------------------------------------------------------
+
+  +-------------------------------------------------------------------------+
+  |                          USER / CLIENT                                  |
+  |                  (CLI chat  /  API  /  Web UI)                          |
+  +-----------------------------------+-------------------------------------+
+                                      |  Natural-language input
+                                      v
+  +-------------------------------------------------------------------------+
+  |                       LANGGRAPH AGENT                                   |
+  |                       (agent/agent.py)                                  |
+  |                                                                         |
+  |   - Powered by  Amazon Bedrock - Claude 3 Sonnet                        |
+  |   - Reads user intent and decides which tool to call                    |
+  |   - Uses MultiServerMCPClient (langchain-mcp-adapters) to talk to MCP  |
+  |   - Loops: call model -> call tool -> call model -> final answer        |
+  +-----------------------------------+-------------------------------------+
+                                      |  MCP protocol (stdio)
+                                      v
+  +-------------------------------------------------------------------------+
+  |                        MCP SERVER                                       |
+  |                    (mcp_server/server.py)                               |
+  |                    Built with FastMCP                                   |
+  |                                                                         |
+  |   Registers 5 tools the agent can call:                                 |
+  |   +---------------------------------------------------------------------+|
+  |   |  TOOL 1 - upload_and_process_document                              ||
+  |   |  TOOL 2 - rag_search                                               ||
+  |   |  TOOL 3a - search_relevant_pages                                   ||
+  |   |  TOOL 3b - store_document_pages                                    ||
+  |   |  TOOL 3c - list_stored_documents                                   ||
+  |   +---------------------------------------------------------------------+|
+  +--------+----------------------+----------------------+------------------+
+           |                      |                      |
+           v                      v                      v
+  +---------------+      +----------------+     +----------------------------+
+  |   TOOL 1      |      |    TOOL 2      |     |         TOOL 3             |
+  |  Document     |      |  RAG Search    |     |  Doc Storage & Page Search |
+  |  Pipeline     |      |                |     |                            |
+  +-------+-------+      +-------+--------+     +------------+---------------+
+          |                      |                           |
+          +----------------------+---------------------------+
+                                 |
+  +---------------------------------------------------------------------+
+  |                          AWS SERVICES                               |
+  |                                                                     |
+  |  +--------------+  +----------------------+  +------------------+  |
+  |  |  Amazon S3   |  | Amazon OpenSearch    |  | Amazon Bedrock   |  |
+  |  |              |  |   Serverless         |  | Knowledge Base   |  |
+  |  | Raw document |  |                      |  |                  |  |
+  |  |   storage    |  | Vector index         |  | Managed RAG      |  |
+  |  | (PDF/DOCX/   |  | (HNSW k-NN search)  |  | retrieval        |  |
+  |  |  TXT/MD)     |  | Embeddings stored    |  | (backed by OSS)  |  |
+  |  +--------------+  +----------------------+  +------------------+  |
+  |                                                                     |
+  |  +----------------------------------------------------------------+ |
+  |  |           Amazon Bedrock Foundation Models                     | |
+  |  |   Claude 3 Sonnet  (LLM - answers, summaries)                 | |
+  |  |   Titan Embed v2   (Embeddings - vectorise text chunks)       | |
+  |  +----------------------------------------------------------------+ |
+  |                                                                     |
+  |  +----------------------------------------------------------------+ |
+  |  |  IAM Roles  |  SSM Parameter Store  |  CDK (infra/app.py)    | |
+  |  +----------------------------------------------------------------+ |
+  +---------------------------------------------------------------------+
+
+--------------------------------------------------------------------------------
+  TOOL ROUTING LOGIC  (how the agent picks a tool)
+--------------------------------------------------------------------------------
+
+  User says...                              Agent calls...
+  ----------------------------------------  ----------------------------------
+  "Upload / process / ingest this file"  -> upload_and_process_document
+  "Summarize / answer a question"        -> rag_search
+  "Find pages / retrieve passages"       -> search_relevant_pages
+  "What documents are stored?"           -> list_stored_documents
+  "Index these text pages directly"      -> store_document_pages
+
+--------------------------------------------------------------------------------
+  TOOL 1 - Document Upload, Parsing, Embeddings & Summarization
+--------------------------------------------------------------------------------
+
+  Input : base64-encoded file  +  filename  +  optional metadata
+  Output: doc_id, page_count, chunk_count, s3_key, summary
+
+  Flow:
+  +----------+    +----------+    +--------------+    +------------------+
+  |  Decode  |--->| Upload   |--->| Parse text   |--->| Chunk text       |
+  |  base64  |    |  to S3   |    | PyMuPDF/docx |    | (1000 tok / 200  |
+  +----------+    +----------+    +--------------+    |  overlap)        |
+                                                      +--------+---------+
+                                                               |
+                                         +---------------------v----------+
+                                         |  Titan Embed v2                |
+                                         |  Generate vector per chunk     |
+                                         +---------------------+----------+
+                                                               |
+                                         +---------------------v----------+
+                                         |  OpenSearch Serverless         |
+                                         |  Bulk-index chunks + vectors   |
+                                         +---------------------+----------+
+                                                               |
+                                         +---------------------v----------+
+                                         |  Claude 3 Sonnet               |
+                                         |  Generate document summary     |
+                                         +--------------------------------+
+
+--------------------------------------------------------------------------------
+  TOOL 2 - RAG Search (Bedrock Knowledge Base)
+--------------------------------------------------------------------------------
+
+  Input : query (natural-language question)  +  top_k
+  Output: answer, sources list, retrieved_chunks count
+
+  Flow:
+  +--------------+    +----------------------+    +----------------------+
+  |  User query  |--->|  Bedrock KB          |--->|  Claude 3 Sonnet     |
+  |              |    |  Retriever           |    |                      |
+  |              |    |  (AmazonKnowledge    |    |  Generates grounded  |
+  |              |    |   BasesRetriever)    |    |  answer from context |
+  |              |    |  Returns top-k docs  |    |                      |
+  +--------------+    +----------------------+    +----------------------+
+
+  Note: Bedrock KB is backed by the same OpenSearch Serverless collection.
+        If the answer is not in the retrieved context, Claude says so.
+
+--------------------------------------------------------------------------------
+  TOOL 3 - Document Storage & Relevant Page Search
+--------------------------------------------------------------------------------
+
+  3a. store_document_pages
+      Input : doc_id, filename, list of {text, page_number, metadata}
+      Output: stored_count, index_name
+      ------------------------------------------------------------------
+      Text pages -> Titan Embed v2 -> OpenSearch Serverless (bulk write)
+
+  3b. search_relevant_pages
+      Input : query, top_k, optional doc_id / filename filter
+      Output: ranked list of {rank, score, page_number, text_excerpt}
+      ------------------------------------------------------------------
+      Query -> Titan Embed v2 -> k-NN search in OpenSearch -> ranked pages
+
+  3c. list_stored_documents
+      Input : (none)
+      Output: list of {doc_id, filename, chunk_count}
+      ------------------------------------------------------------------
+      Aggregation query on OpenSearch index -> unique document summary
+
+--------------------------------------------------------------------------------
+  AWS INFRASTRUCTURE  (provisioned by CDK - infra/stacks/mcp_stack.py)
+--------------------------------------------------------------------------------
+
+  Resource                    Purpose
+  --------------------------  ------------------------------------------------
+  S3 Bucket                   Store raw uploaded files (versioned)
+  OpenSearch Serverless        Vector index for embeddings (HNSW, cosine)
+  Bedrock Knowledge Base       Managed RAG retrieval layer
+  Bedrock Data Source          Syncs S3 raw-docs/ prefix into KB
+  IAM Role (McpServer)         Least-privilege: S3 + Bedrock + OSS
+  IAM Role (BedrockKB)         Allows KB to read S3 and call Titan Embed
+  SSM Parameters               Store runtime config (bucket, endpoint, KB ID)
+
+  CDK Deploy order:
+  1. S3 Bucket
+  2. OpenSearch Serverless (encryption -> network -> collection -> data access)
+  3. IAM Roles
+  4. Bedrock Knowledge Base  (depends on OSS collection + IAM role)
+  5. Bedrock Data Source      (depends on KB)
+  6. SSM Parameters           (store outputs for runtime use)
+
+--------------------------------------------------------------------------------
+  DATA FLOW SUMMARY
+--------------------------------------------------------------------------------
+
+  INGEST PATH (Tool 1)
+  -----------------------------------------------------------------------
+  User uploads file
+    -> Agent calls upload_and_process_document
+      -> S3 (raw storage)
+      -> Parse (PyMuPDF / python-docx)
+      -> Chunk (RecursiveCharacterTextSplitter)
+      -> Titan Embed v2 (vectors)
+      -> OpenSearch Serverless (index)
+      -> Claude 3 Sonnet (summary)
+    -> Agent returns summary to user
+
+  QUERY PATH (Tool 2 - RAG)
+  -----------------------------------------------------------------------
+  User asks a question
+    -> Agent calls rag_search
+      -> Bedrock KB Retriever (semantic search -> top-k chunks)
+      -> Claude 3 Sonnet (grounded answer)
+    -> Agent returns answer + sources to user
+
+  RETRIEVAL PATH (Tool 3 - Page Search)
+  -----------------------------------------------------------------------
+  User asks for specific pages/passages
+    -> Agent calls search_relevant_pages
+      -> Titan Embed v2 (embed query)
+      -> OpenSearch k-NN search (ranked pages with scores)
+    -> Agent returns ranked page excerpts to user
+
+--------------------------------------------------------------------------------
+  KEY DESIGN DECISIONS
+--------------------------------------------------------------------------------
+
+  1. MCP over direct function calls
+     Tools are exposed as MCP tools so the agent can discover and call them
+     dynamically. Adding a new tool only requires registering it on the server -
+     no agent code changes needed.
+
+  2. Dual indexing (Tool 1 + Tool 3)
+     Tool 1 indexes during upload (full pipeline).
+     Tool 3 allows indexing pre-extracted text directly (flexible ingestion).
+
+  3. Two retrieval strategies
+     Tool 2 uses Bedrock Knowledge Base (managed, higher-level RAG).
+     Tool 3 uses direct OpenSearch k-NN (lower-level, filterable by doc/page).
+
+  4. Single vector store
+     Both Tool 2 (via KB) and Tool 3 (direct) point to the same OpenSearch
+     Serverless collection, keeping data consistent.
+
+  5. CDK for infra-as-code
+     All AWS resources are defined in one CDK stack. A single "cdk deploy"
+     provisions everything. SSM Parameters pass runtime config to the app.
+
+================================================================================
