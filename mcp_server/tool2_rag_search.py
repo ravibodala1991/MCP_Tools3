@@ -1,122 +1,180 @@
 """
-Tool 2 – RAG Search via Amazon Bedrock Knowledge Base
-======================================================
-Uses LangChain's AmazonKnowledgeBasesRetriever to query an existing
-Bedrock Knowledge Base, then passes the retrieved context to Claude 3
-Sonnet to generate a grounded answer.
+Tool 2 – RAG Search (FAISS + Claude 3.5 Sonnet)
+================================================
+Flow:
+  1. Embed the user query with Amazon Titan Embed v2.
+  2. Search the local FAISS index for the top-k most similar chunks.
+  3. Build a context string from retrieved chunks.
+  4. Send context + query to Claude 3.5 Sonnet via Bedrock.
+  5. Return the grounded answer + source references.
 
-Reference: https://python.langchain.com/v0.1/docs/integrations/retrievers/bedrock/
+The FAISS index is built from existing S3 documents via Tool 1.
+On first startup, if the index is empty, call build_index_from_s3()
+to process all existing files in the S3 documents/ folder.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
-import boto3
-from langchain_aws import AmazonKnowledgeBasesRetriever
-from langchain_aws.chat_models import ChatBedrock
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from utils import (
+    AWS_REGION,
+    LLM_MODEL_ID,
+    S3_BUCKET,
+    S3_DOCS_PREFIX,
+    append_to_faiss,
+    chunk_text,
+    download_from_s3,
+    embed_query,
+    get_bedrock_client,
+    list_s3_documents,
+    make_doc_id,
+    parse_with_markitdown,
+    embed_texts,
+    search_faiss,
+)
 
-# ── env / config ──────────────────────────────────────────────────────────────
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-KNOWLEDGE_BASE_ID = os.environ.get("KNOWLEDGE_BASE_ID", "")
-LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
 
-# ── AWS clients ───────────────────────────────────────────────────────────────
-bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
+# ── Build index from existing S3 data ────────────────────────────────────────
 
-def _build_rag_chain(top_k: int = RAG_TOP_K):
+def build_index_from_s3() -> dict[str, Any]:
     """
-    Build a LangChain RAG chain backed by Bedrock Knowledge Base.
+    Process all existing documents in S3_DOCS_PREFIX and build/rebuild
+    the FAISS index. Call this once to bootstrap from existing S3 data.
 
-    Returns a runnable that accepts {"query": str} and returns a str answer.
+    Returns: {processed_files, total_chunks, total_vectors}
     """
-    retriever = AmazonKnowledgeBasesRetriever(
-        knowledge_base_id=KNOWLEDGE_BASE_ID,
-        retrieval_config={"vectorSearchConfiguration": {"numberOfResults": top_k}},
-        region_name=AWS_REGION,
+    s3_objects = list_s3_documents()
+    if not s3_objects:
+        return {"processed_files": 0, "total_chunks": 0, "total_vectors": 0, "message": "No files found in S3."}
+
+    processed = 0
+    total_chunks = 0
+
+    for obj in s3_objects:
+        key = obj["key"]
+        filename = key.split("/")[-1]
+        if not filename or "." not in filename:
+            continue  # skip folder markers
+
+        try:
+            file_bytes = download_from_s3(key)
+            markdown_text = parse_with_markitdown(file_bytes, filename)
+            chunks = chunk_text(markdown_text)
+            if not chunks:
+                continue
+
+            # Use the S3 key path as a stable doc_id
+            doc_id = make_doc_id(key)
+            vectors = embed_texts(chunks)
+            chunk_metas = [
+                {
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "s3_key": key,
+                    "chunk_index": i,
+                    "text": chunk,
+                }
+                for i, chunk in enumerate(chunks)
+            ]
+            total_vectors = append_to_faiss(vectors, chunk_metas)
+            total_chunks += len(chunks)
+            processed += 1
+        except Exception as e:
+            print(f"[build_index] Skipping {key}: {e}")
+            continue
+
+    return {
+        "processed_files": processed,
+        "total_chunks": total_chunks,
+        "total_vectors": total_vectors if processed > 0 else 0,
+    }
+
+
+# ── RAG answer generation ─────────────────────────────────────────────────────
+
+def _generate_answer(query: str, context_chunks: list[dict]) -> str:
+    """Call Claude 3.5 Sonnet with retrieved context to generate a grounded answer."""
+    client = get_bedrock_client()
+
+    context_text = "\n\n---\n\n".join(
+        f"[Source: {c.get('filename', 'unknown')} | chunk {c.get('chunk_index', '?')}]\n{c.get('text', '')}"
+        for c in context_chunks
     )
 
-    llm = ChatBedrock(
-        client=bedrock_runtime,
-        model_id=LLM_MODEL_ID,
-        region_name=AWS_REGION,
-        model_kwargs={"max_tokens": 2048, "temperature": 0.1},
+    prompt = (
+        "You are a helpful assistant. Answer the user's question using ONLY the "
+        "context provided below. If the answer is not in the context, say "
+        "'I don't have enough information to answer that based on the available documents.'\n\n"
+        f"CONTEXT:\n{context_text}\n\n"
+        f"QUESTION: {query}"
     )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "You are a helpful assistant. Answer the user's question using ONLY "
-                    "the context provided below. If the answer is not in the context, "
-                    "say 'I don't have enough information to answer that.'\n\n"
-                    "CONTEXT:\n{context}"
-                ),
-            ),
-            ("human", "{query}"),
-        ]
-    )
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2048,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": prompt}],
+    })
 
-    def format_docs(docs):
-        return "\n\n---\n\n".join(
-            f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}"
-            for d in docs
-        )
-
-    chain = (
-        {"context": retriever | format_docs, "query": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+    resp = client.invoke_model(
+        modelId=LLM_MODEL_ID,
+        body=body,
+        contentType="application/json",
+        accept="application/json",
     )
-    return chain, retriever
+    result = json.loads(resp["body"].read())
+    return result["content"][0]["text"]
 
 
 # ── Main tool function ────────────────────────────────────────────────────────
 
 def rag_search(query: str, top_k: int = RAG_TOP_K) -> dict[str, Any]:
     """
-    Perform a RAG search against the Bedrock Knowledge Base.
+    Answer a question using RAG over the FAISS vector index.
 
     Args:
-        query:  Natural-language question to answer.
-        top_k:  Number of document chunks to retrieve (default 5).
+        query:  Natural-language question.
+        top_k:  Number of chunks to retrieve (default 5).
 
     Returns:
-        dict with answer, sources (list of dicts), and retrieved_chunks count.
+        {query, answer, retrieved_chunks, sources}
     """
-    if not KNOWLEDGE_BASE_ID:
-        raise EnvironmentError(
-            "KNOWLEDGE_BASE_ID environment variable is not set. "
-            "Deploy the CDK stack first and set the variable."
-        )
+    # Embed query
+    q_vector = embed_query(query)
 
-    chain, retriever = _build_rag_chain(top_k=top_k)
+    # Search FAISS
+    results = search_faiss(q_vector, top_k=top_k)
 
-    # Retrieve source docs separately so we can return them
-    source_docs = retriever.invoke(query)
-    sources = [
-        {
-            "source": d.metadata.get("source", "unknown"),
-            "score": d.metadata.get("score"),
-            "excerpt": d.page_content[:300],
+    if not results:
+        return {
+            "query": query,
+            "answer": "No documents are indexed yet. Please upload documents first using Tool 1.",
+            "retrieved_chunks": 0,
+            "sources": [],
         }
-        for d in source_docs
-    ]
 
     # Generate grounded answer
-    answer = chain.invoke(query)
+    answer = _generate_answer(query, results)
+
+    sources = [
+        {
+            "filename": r.get("filename", "unknown"),
+            "s3_key": r.get("s3_key", ""),
+            "chunk_index": r.get("chunk_index", 0),
+            "score": round(r.get("score", 0.0), 4),
+            "excerpt": r.get("text", "")[:300],
+        }
+        for r in results
+    ]
 
     return {
         "query": query,
         "answer": answer,
-        "retrieved_chunks": len(source_docs),
+        "retrieved_chunks": len(results),
         "sources": sources,
     }

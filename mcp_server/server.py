@@ -1,42 +1,52 @@
 """
-MCP Server – Document Intelligence
-====================================
-Exposes three MCP tools via FastMCP (stdio transport):
+MCP Server – Document Intelligence (Local)
+==========================================
+Exposes tools via FastMCP using stdio transport.
+Start this server before launching the Chainlit app.
 
-  • upload_and_process_document  (Tool 1)
-  • rag_search                   (Tool 2)
-  • search_relevant_pages        (Tool 3 – search)
-  • store_document_pages         (Tool 3 – store)
-  • list_stored_documents        (Tool 3 – list)
+Tools:
+  1. upload_and_process_document  – S3 upload + MarkItDown parse + FAISS embed + Claude summary
+  2. rag_search                   – FAISS k-NN retrieval + Claude grounded answer
+  3. build_index_from_s3          – Bootstrap FAISS index from existing S3 documents
+  4. search_relevant_pages        – FAISS page/chunk search with optional filters
+  5. list_stored_documents        – List all indexed documents
+  6. get_document_chunks          – Retrieve all chunks for a document
 
 Run:
-    python mcp_server/server.py
+    cd mcp_server
+    python server.py
 """
+
+import sys
+import os
+
+# Ensure mcp_server/ is on the path so relative imports work
+sys.path.insert(0, os.path.dirname(__file__))
 
 from mcp.server.fastmcp import FastMCP
 
-from tool1_document import upload_parse_embed_summarize
-from tool2_rag_search import rag_search as _rag_search
+from tool1_document import process_document
+from tool2_rag_search import build_index_from_s3 as _build_index, rag_search as _rag_search
 from tool3_doc_storage import (
-    list_stored_documents as _list_stored_documents,
-    search_relevant_pages as _search_relevant_pages,
-    store_document_pages as _store_document_pages,
+    get_document_chunks as _get_chunks,
+    list_stored_documents as _list_docs,
+    search_relevant_pages as _search_pages,
 )
 
 mcp = FastMCP("DocumentIntelligenceMCP")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 1 – Document Upload, Parsing, Embeddings & Summarization
+# Tool 1 – Upload, Parse, Embed, Summarize
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool(
     name="upload_and_process_document",
     description=(
-        "Upload a document (PDF, DOCX, TXT, MD), parse its text, generate vector "
-        "embeddings for each chunk, store them in OpenSearch, and return a summary "
-        "of the document produced by Claude 3 Sonnet. "
-        "Use this tool when the user uploads or mentions a new document."
+        "Upload a document (PDF, DOCX, PPTX, TXT, MD, HTML, images) to S3, "
+        "parse it with MarkItDown, generate Titan embeddings for each chunk, "
+        "append them to the FAISS vector index, and return a Claude 3.5 Sonnet "
+        "summary. Use this when the user attaches or uploads a new document."
     ),
 )
 def upload_and_process_document(
@@ -47,31 +57,25 @@ def upload_and_process_document(
     """
     Args:
         file_b64:  Base64-encoded file bytes.
-        filename:  Original filename with extension (e.g. 'report.pdf').
-        metadata:  Optional dict of extra metadata (author, department, etc.).
-
+        filename:  Original filename with extension.
+        metadata:  Optional extra metadata dict.
     Returns:
-        {doc_id, filename, s3_key, page_count, chunk_count, summary}
+        {doc_id, filename, s3_key, chunk_count, total_vectors, summary}
     """
-    return upload_parse_embed_summarize(
-        file_b64=file_b64,
-        filename=filename,
-        metadata=metadata,
-    )
+    return process_document(file_b64=file_b64, filename=filename, metadata=metadata)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 2 – RAG Search (Bedrock Knowledge Base)
+# Tool 2 – RAG Search
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool(
     name="rag_search",
     description=(
-        "Answer a question using Retrieval-Augmented Generation (RAG) backed by "
-        "Amazon Bedrock Knowledge Base. Retrieves the most relevant document chunks "
-        "and generates a grounded answer with Claude 3 Sonnet. "
-        "Use this tool when the user asks a question or requests a summary/explanation "
-        "about content that has already been ingested."
+        "Answer a question using RAG: embed the query with Titan, retrieve the "
+        "top-k most relevant chunks from the FAISS index, then generate a grounded "
+        "answer with Claude 3.5 Sonnet. Use this when the user asks a question "
+        "about document content or requests an explanation."
     ),
 )
 def rag_search_tool(query: str, top_k: int = 5) -> dict:
@@ -79,50 +83,39 @@ def rag_search_tool(query: str, top_k: int = 5) -> dict:
     Args:
         query:  Natural-language question.
         top_k:  Number of chunks to retrieve (default 5).
-
     Returns:
         {query, answer, retrieved_chunks, sources}
     """
     return _rag_search(query=query, top_k=top_k)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool 3 – Document Storage & Relevant Page Search
-# ─────────────────────────────────────────────────────────────────────────────
-
 @mcp.tool(
-    name="store_document_pages",
+    name="build_index_from_s3",
     description=(
-        "Store pre-parsed document pages or text chunks directly into the vector "
-        "store (OpenSearch Serverless). Use this when you have already extracted "
-        "text and want to index it without re-uploading the original file."
+        "Bootstrap or rebuild the FAISS vector index by processing all existing "
+        "documents in the S3 documents/ folder. Run this once on first setup or "
+        "when you want to re-index all S3 content."
     ),
 )
-def store_document_pages_tool(
-    doc_id: str,
-    filename: str,
-    pages: list,
-) -> dict:
+def build_index_from_s3_tool() -> dict:
     """
-    Args:
-        doc_id:    Unique document identifier.
-        filename:  Original filename.
-        pages:     List of {text, page_number, metadata} dicts.
-
     Returns:
-        {doc_id, filename, stored_count, index_name}
+        {processed_files, total_chunks, total_vectors}
     """
-    return _store_document_pages(doc_id=doc_id, filename=filename, pages=pages)
+    return _build_index()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 3 – Document Storage & Page Search
+# ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool(
     name="search_relevant_pages",
     description=(
-        "Search the vector store for the most relevant document pages or chunks "
-        "matching a query. Returns ranked results with similarity scores and text "
-        "excerpts. Optionally filter by doc_id or filename. "
-        "Use this tool when the user wants to retrieve specific pages or passages "
-        "from stored documents."
+        "Search the FAISS vector index for the most relevant document pages or "
+        "chunks matching a query. Returns ranked results with similarity scores "
+        "and text excerpts. Optionally filter by doc_id or filename. "
+        "Use this when the user wants to find specific passages or pages."
     ),
 )
 def search_relevant_pages_tool(
@@ -133,39 +126,49 @@ def search_relevant_pages_tool(
 ) -> dict:
     """
     Args:
-        query:    Natural-language search query.
+        query:    Search query.
         top_k:    Number of results (default 5).
         doc_id:   Optional filter by document ID.
         filename: Optional filter by filename.
-
     Returns:
-        {query, total_found, results: [{rank, score, doc_id, filename, page_number, text_excerpt}]}
+        {query, total_found, results}
     """
-    return _search_relevant_pages(
-        query=query,
-        top_k=top_k,
-        doc_id=doc_id,
-        filename=filename,
-    )
+    return _search_pages(query=query, top_k=top_k, doc_id=doc_id, filename=filename)
 
 
 @mcp.tool(
     name="list_stored_documents",
     description=(
-        "List all documents currently stored in the vector index, with their "
-        "doc_id, filename, and chunk count. Use this to discover what documents "
-        "are available for search."
+        "List all documents currently indexed in FAISS, with doc_id, filename, "
+        "and chunk count. Use this to see what documents are available for search."
     ),
 )
 def list_stored_documents_tool() -> dict:
     """
     Returns:
-        {total_documents, documents: [{doc_id, filename, chunk_count}]}
+        {total_documents, total_vectors, documents}
     """
-    return _list_stored_documents()
+    return _list_docs()
+
+
+@mcp.tool(
+    name="get_document_chunks",
+    description=(
+        "Retrieve all stored text chunks for a specific document by its doc_id. "
+        "Useful for inspecting what was indexed for a particular file."
+    ),
+)
+def get_document_chunks_tool(doc_id: str) -> dict:
+    """
+    Args:
+        doc_id: Document ID to retrieve chunks for.
+    Returns:
+        {doc_id, filename, chunk_count, chunks}
+    """
+    return _get_chunks(doc_id=doc_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # stdio transport – consumed by the LangChain MultiServerMCPClient
+    print("[MCP Server] Starting DocumentIntelligenceMCP on stdio...", flush=True)
     mcp.run(transport="stdio")

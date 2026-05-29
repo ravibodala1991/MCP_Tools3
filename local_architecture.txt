@@ -1,0 +1,269 @@
+================================================================================
+  LOCAL ARCHITECTURE – Document Intelligence MCP Solution
+================================================================================
+
+--------------------------------------------------------------------------------
+  OVERVIEW
+--------------------------------------------------------------------------------
+A fully local-runnable document intelligence system. The Chainlit web UI talks
+to a LangGraph agent which dynamically calls MCP tools running in a local
+FastMCP server. AWS Bedrock is used for embeddings and LLM inference.
+FAISS runs entirely on local disk – no cloud vector DB needed.
+
+--------------------------------------------------------------------------------
+  LOCAL COMPONENT DIAGRAM
+--------------------------------------------------------------------------------
+
+  Browser (localhost:8080)
+       |
+       | HTTP
+       v
+  +---------------------------+
+  |   Chainlit App            |
+  |   chainlit_app.py         |
+  |                           |
+  |  - File upload handler    |
+  |  - Chat message handler   |
+  |  - Session history        |
+  +------------+--------------+
+               |
+               | Python in-process
+               v
+  +---------------------------+
+  |   LangGraph ReAct Agent   |
+  |                           |
+  |  LLM: ChatBedrockConverse |
+  |  (Claude 3.5 Sonnet)      |
+  |                           |
+  |  Loop:                    |
+  |  call_model               |
+  |    -> tools_condition     |
+  |       -> ToolNode         |
+  |          -> call_model    |
+  +------------+--------------+
+               |
+               | stdio (subprocess)
+               | langchain-mcp-adapters
+               | MultiServerMCPClient
+               v
+  +---------------------------+
+  |   MCP Server              |
+  |   mcp_server/server.py    |
+  |   (FastMCP, stdio)        |
+  |                           |
+  |   Tool 1                  |
+  |   Tool 2                  |
+  |   Tool 3 (x3)             |
+  |   build_index_from_s3     |
+  +---+-------+-------+-------+
+      |       |       |
+      |       |       +---------------------------+
+      |       |                                   |
+      v       v                                   v
+  +--------+ +------------------+    +------------------------+
+  | AWS S3 | | FAISS Index      |    | Amazon Bedrock         |
+  |        | | (local disk)     |    |                        |
+  | Bucket | | faiss_index/     |    | Titan Embed v2         |
+  | docs/  | |  index.faiss     |    | (embeddings)           |
+  |        | |  metadata.pkl    |    |                        |
+  +--------+ +------------------+    | Claude 3.5 Sonnet      |
+                                     | (answers + summaries)  |
+                                     +------------------------+
+
+--------------------------------------------------------------------------------
+  TOOL ROUTING (how the agent decides which tool to call)
+--------------------------------------------------------------------------------
+
+  User action / message                    Tool called
+  ---------------------------------------  ----------------------------------------
+  Uploads a file (PDF/DOCX/TXT/MD/etc.)   upload_and_process_document  (Tool 1)
+  Asks a question about documents          rag_search                   (Tool 2)
+  "find pages about X"                     search_relevant_pages        (Tool 3)
+  "what documents are indexed?"            list_stored_documents        (Tool 3)
+  "rebuild index from S3"                  build_index_from_s3          (Tool 2)
+  "show chunks for doc abc123"             get_document_chunks          (Tool 3)
+
+--------------------------------------------------------------------------------
+  TOOL 1 – upload_and_process_document
+--------------------------------------------------------------------------------
+
+  Input:  file_b64 (base64), filename, optional metadata
+  Output: {doc_id, filename, s3_key, chunk_count, total_vectors, summary}
+
+  +----------+     +----------+     +------------------+     +--------------+
+  | Decode   |---->| Upload   |---->| MarkItDown       |---->| chunk_text() |
+  | base64   |     | to S3    |     | parse to         |     | 800 chars /  |
+  |          |     | docs/    |     | clean Markdown   |     | 150 overlap  |
+  +----------+     +----------+     +------------------+     +------+-------+
+                                                                    |
+                                              +---------------------v---------+
+                                              | Titan Embed v2 (Bedrock)      |
+                                              | embed_texts() -> np.ndarray   |
+                                              +---------------------+---------+
+                                                                    |
+                                              +---------------------v---------+
+                                              | append_to_faiss()             |
+                                              | Normalise L2 -> IndexFlatIP   |
+                                              | Append vectors + metadata     |
+                                              | Save index.faiss + meta.pkl   |
+                                              +---------------------+---------+
+                                                                    |
+                                              +---------------------v---------+
+                                              | summarize_with_claude()       |
+                                              | Claude 3.5 Sonnet (Bedrock)   |
+                                              | Returns structured summary    |
+                                              +-------------------------------+
+
+--------------------------------------------------------------------------------
+  TOOL 2 – rag_search
+--------------------------------------------------------------------------------
+
+  Input:  query (str), top_k (int, default 5)
+  Output: {query, answer, retrieved_chunks, sources}
+
+  +-------------+     +------------------+     +------------------+
+  | User query  |---->| embed_query()    |---->| search_faiss()   |
+  |             |     | Titan Embed v2   |     | IndexFlatIP      |
+  |             |     | -> (1, 1024)     |     | cosine sim       |
+  |             |     | normalise L2     |     | top-k results    |
+  +-------------+     +------------------+     +--------+---------+
+                                                        |
+                                       +----------------v-----------------+
+                                       | _generate_answer()               |
+                                       | Build context from chunks        |
+                                       | Claude 3.5 Sonnet (Bedrock)      |
+                                       | Grounded answer + sources        |
+                                       +----------------------------------+
+
+  build_index_from_s3 (bootstrap):
+  +----------+     +------------------+     +------------------+
+  | List S3  |---->| Download each    |---->| MarkItDown parse |
+  | objects  |     | file             |     | -> chunk -> embed|
+  +----------+     +------------------+     | -> append FAISS  |
+                                            +------------------+
+
+--------------------------------------------------------------------------------
+  TOOL 3 – search_relevant_pages / list_stored_documents / get_document_chunks
+--------------------------------------------------------------------------------
+
+  search_relevant_pages:
+  Query -> embed_query() -> search_faiss() -> optional filter by doc_id/filename
+  -> ranked [{rank, score, filename, chunk_index, text_excerpt}]
+
+  list_stored_documents:
+  load_faiss_index() -> aggregate metadata by doc_id
+  -> [{doc_id, filename, chunk_count}]
+
+  get_document_chunks:
+  load_faiss_index() -> filter metadata by doc_id -> sorted chunks
+  -> [{chunk_index, text}]
+
+--------------------------------------------------------------------------------
+  FAISS INDEX STRUCTURE (local disk)
+--------------------------------------------------------------------------------
+
+  faiss_index/
+  ├── index.faiss      # FAISS IndexFlatIP (inner product = cosine on L2-normalised vecs)
+  └── metadata.pkl     # Python list of dicts, one per vector:
+                       #   {doc_id, filename, s3_key, chunk_index, text, ...extra}
+
+  Vector dimension: 1024  (Amazon Titan Embed v2 default)
+  Similarity:       Cosine (vectors normalised before add/search)
+  Persistence:      Saved to disk after every append
+
+--------------------------------------------------------------------------------
+  SHARED UTILITIES (mcp_server/utils.py)
+--------------------------------------------------------------------------------
+
+  Function                  Used by        Purpose
+  ------------------------  -------------  ------------------------------------
+  embed_texts(texts)        Tool 1, 2      Batch embed via Titan v2 Bedrock
+  embed_query(text)         Tool 2, 3      Single query embed
+  parse_with_markitdown()   Tool 1, 2      File bytes -> Markdown text
+  chunk_text(text)          Tool 1, 2      Split text into overlapping chunks
+  append_to_faiss()         Tool 1, 2      Add vectors + metadata to index
+  search_faiss()            Tool 2, 3      k-NN search in FAISS
+  load_faiss_index()        Tool 3         Read index + metadata from disk
+  save_faiss_index()        Tool 1, 2      Write index + metadata to disk
+  get_all_doc_ids()         Tool 3         Aggregate unique docs from metadata
+  upload_to_s3()            Tool 1         Put file bytes to S3
+  download_from_s3()        Tool 2         Get file bytes from S3
+  list_s3_documents()       Tool 2         List objects under S3_DOCS_PREFIX
+  summarize_with_claude()   Tool 1         Claude 3.5 Sonnet summary via Bedrock
+  make_doc_id()             Tool 1, 2      Generate short unique doc ID
+
+--------------------------------------------------------------------------------
+  HOW TO RUN LOCALLY
+--------------------------------------------------------------------------------
+
+  Step 1 – Install dependencies
+  ------------------------------
+  pip install -r requirements.txt
+
+  Step 2 – Configure environment
+  --------------------------------
+  copy .env.example .env
+  # Edit .env: set S3_BUCKET, AWS_REGION, FAISS_INDEX_DIR
+
+  Step 3 – (Optional) Bootstrap FAISS from existing S3 data
+  -----------------------------------------------------------
+  The agent will call build_index_from_s3 automatically, or you can
+  trigger it from the chat: "rebuild index from S3"
+
+  Step 4 – Start the Chainlit app
+  ---------------------------------
+  chainlit run chainlit_app.py --port 8080
+
+  The MCP server (mcp_server/server.py) is launched automatically as a
+  subprocess by MultiServerMCPClient when the Chainlit app starts.
+  No separate terminal needed.
+
+  Step 5 – Open browser
+  ----------------------
+  http://localhost:8080
+
+  Step 6 – Test
+  --------------
+  - Drag and drop a PDF/DOCX/TXT file into the chat
+  - Ask: "What is this document about?"
+  - Ask: "Find pages about <topic>"
+  - Ask: "What documents are indexed?"
+
+--------------------------------------------------------------------------------
+  PROCESS DIAGRAM (runtime)
+--------------------------------------------------------------------------------
+
+  Terminal 1 (only one needed):
+  +------------------------------------------+
+  |  chainlit run chainlit_app.py --port 8080 |
+  |                                           |
+  |  Chainlit starts                          |
+  |    -> MultiServerMCPClient spawns         |
+  |       mcp_server/server.py as subprocess  |
+  |    -> LangGraph agent initialised         |
+  |    -> Browser opens at localhost:8080     |
+  +------------------------------------------+
+
+  Subprocess (auto-managed):
+  +------------------------------------------+
+  |  python mcp_server/server.py             |
+  |  (stdio transport, managed by client)    |
+  +------------------------------------------+
+
+--------------------------------------------------------------------------------
+  AWS SERVICES USED (local dev)
+--------------------------------------------------------------------------------
+
+  Service               Usage                         Cost note
+  --------------------  ----------------------------  -------------------------
+  Amazon S3             Store raw uploaded documents  Pay per GB stored
+  Amazon Bedrock        Titan Embed v2 (embeddings)   Pay per 1K tokens
+                        Claude 3.5 Sonnet (LLM)       Pay per input/output token
+  IAM                   Inbuilt credentials / role    Free
+
+  NOT used locally:
+  - OpenSearch Serverless  (replaced by local FAISS)
+  - Bedrock Knowledge Base (replaced by FAISS + custom RAG)
+  - Lambda / API Gateway   (not needed for local run)
+
+================================================================================
