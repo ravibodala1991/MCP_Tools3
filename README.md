@@ -1,126 +1,213 @@
 # Document Intelligence MCP – End-to-End Project
 
-An MCP-based document intelligence solution where a LangGraph agent automatically
+An MCP-based document intelligence system where a LangGraph Agent automatically
 routes user requests to the correct tool based on intent.
+
+Built with: **Microsoft MarkItDown** + **FAISS** (local vector store) + **Amazon Bedrock** (Claude 3.5 Sonnet + Titan Embed v2) + **Chainlit** UI + **FastMCP** server.
+
+---
 
 ## Architecture
 
 ```
-User ──► LangGraph Agent (agent/agent.py)
-              │
-              │  MultiServerMCPClient (langchain-mcp-adapters)
-              │
-         MCP Server (mcp_server/server.py)
-         ├── Tool 1: upload_and_process_document
-         │     S3 (raw storage) → PyMuPDF/docx parse → Titan Embeddings → OpenSearch
-         │     → Claude 3 Sonnet (summary)
-         ├── Tool 2: rag_search
-         │     Bedrock Knowledge Base Retriever → Claude 3 Sonnet (grounded answer)
-         └── Tool 3: search_relevant_pages / store_document_pages / list_stored_documents
-               OpenSearch Serverless (k-NN vector search)
+User (Browser)
+    |
+    | http://localhost:8080
+    v
+Chainlit App  (chainlit_app.py)
+    |
+    | in-process
+    v
+LangGraph ReAct Agent
+    | Claude 3.5 Sonnet (Bedrock)
+    |
+    | stdio subprocess
+    | MultiServerMCPClient (langchain-mcp-adapters)
+    v
+MCP Server  (mcp_server/server.py)  [FastMCP]
+    |
+    +-- Tool 1: upload_and_process_document
+    |     S3 upload -> MarkItDown parse -> Titan Embed -> FAISS append -> Claude summary
+    |
+    +-- Tool 2: rag_search
+    |     FAISS k-NN search -> Claude grounded answer
+    |
+    +-- Tool 2: build_index_from_s3
+    |     Bootstrap FAISS from existing S3 documents
+    |
+    +-- Tool 3: search_relevant_pages
+    |     FAISS k-NN -> ranked page excerpts
+    |
+    +-- Tool 3: list_stored_documents
+    |     Aggregate unique docs from FAISS metadata
+    |
+    +-- Tool 3: get_document_chunks
+          All chunks for a specific doc_id
 
-AWS Infrastructure (infra/ – CDK)
-  ├── S3 Bucket              – raw document storage
-  ├── OpenSearch Serverless  – vector index (HNSW, cosine similarity)
-  ├── Bedrock Knowledge Base – managed RAG retrieval
-  └── IAM Roles              – least-privilege access
+AWS Services used:
+  - Amazon S3          (raw document storage)
+  - Amazon Bedrock     (Titan Embed v2 + Claude 3.5 Sonnet)
+
+Local storage:
+  - faiss_index/index.faiss    (vector index)
+  - faiss_index/metadata.pkl   (chunk metadata)
 ```
+
+---
 
 ## Tool Routing
 
-| User intent | Tool invoked |
+| User says... | Tool called |
 |---|---|
-| "Upload / process / ingest this document" | `upload_and_process_document` |
-| "Summarize / answer a question about content" | `rag_search` |
-| "Find pages / retrieve passages about X" | `search_relevant_pages` |
-| "What documents are stored?" | `list_stored_documents` |
-| "Index these text pages directly" | `store_document_pages` |
+| Uploads a file | `upload_and_process_document` |
+| Asks a question about documents | `rag_search` |
+| "find pages about X" | `search_relevant_pages` |
+| "what documents are indexed?" | `list_stored_documents` |
+| "rebuild index from S3" | `build_index_from_s3` |
+| "show chunks for doc X" | `get_document_chunks` |
 
-## Quick Start
+---
 
-### 1. Install dependencies
+## How to Run Locally (Sequential Steps)
 
-```bash
+### Step 1 — Prerequisites (one-time)
+
+Make sure you have Python 3.10+ and AWS CLI installed and configured.
+
+```cmd
+python --version
+aws sts get-caller-identity
+```
+
+### Step 2 — Enable Bedrock Model Access (one-time, AWS Console)
+
+Go to **AWS Console → Amazon Bedrock → Model access** and enable:
+- `Claude 3.5 Sonnet`  (`anthropic.claude-3-5-sonnet-20241022-v2:0`)
+- `Titan Text Embeddings V2`  (`amazon.titan-embed-text-v2:0`)
+
+### Step 3 — Create S3 Bucket (one-time)
+
+```cmd
+aws s3 mb s3://mcp-raw-docs --region us-east-1
+```
+
+### Step 4 — Install Python dependencies
+
+```cmd
+cd c:\Users\user\Documents\mcp
 pip install -r requirements.txt
 ```
 
-### 2. Deploy AWS infrastructure
+### Step 5 — Create your .env file
 
-```bash
-cd infra
-pip install -r requirements-cdk.txt
-cdk bootstrap aws://<ACCOUNT_ID>/us-east-1
-cdk deploy --context account=<ACCOUNT_ID> --context region=us-east-1
+```cmd
+copy .env.example .env
 ```
 
-Copy the CDK outputs into your environment:
+Edit `.env` and set at minimum:
 
-```bash
-cp .env.example .env
-# Fill in S3_RAW_BUCKET, OPENSEARCH_ENDPOINT, KNOWLEDGE_BASE_ID from CDK outputs
+```
+AWS_REGION=us-east-1
+S3_BUCKET=mcp-raw-docs
+FAISS_INDEX_DIR=./faiss_index
 ```
 
-### 3. Enable Bedrock model access
+### Step 6 — Start the Chainlit app
 
-In the AWS Console → Amazon Bedrock → Model access, enable:
-- `anthropic.claude-3-sonnet-20240229-v1:0`
-- `amazon.titan-embed-text-v2:0`
-
-### 4. Run the agent
-
-```bash
-# Load env vars
-set -a && source .env && set +a   # Linux/Mac
-# or on Windows: set each variable manually
-
-python agent/agent.py
+```cmd
+chainlit run chainlit_app.py --port 8080
 ```
 
-### 5. Run tests
+This single command starts everything:
+- Chainlit web server on port 8080
+- MCP server (`mcp_server/server.py`) auto-spawned as a subprocess
+- LangGraph agent with all 6 tools loaded
 
-```bash
-# Unit tests (no AWS required)
-pytest test_tools.py -v
+### Step 7 — Open browser
 
-# Integration tests (requires deployed stack + AWS credentials)
-set INTEGRATION_TESTS=1
-pytest test_tools.py -v -m integration
 ```
+http://localhost:8080
+```
+
+### Step 8 — (First time) Bootstrap index from existing S3 data
+
+If you have existing documents in S3, type in the chat:
+```
+rebuild index from S3
+```
+
+Skip this if starting fresh — Tool 1 builds the index automatically on first upload.
+
+### Step 9 — Test
+
+```
+1. Drag and drop a PDF/DOCX/TXT file into the chat
+   -> Tool 1: S3 upload + MarkItDown parse + FAISS embed + Claude summary
+
+2. Ask a question about the document
+   -> Tool 2: FAISS search + Claude grounded answer
+
+3. Find specific pages
+   -> Type: "find pages about <topic>"
+   -> Tool 3: FAISS k-NN search + ranked excerpts
+
+4. List indexed documents
+   -> Type: "what documents are indexed?"
+   -> Tool 3: list_stored_documents
+```
+
+---
+
+## Quick Reference
+
+| Step | Command | Frequency |
+|---|---|---|
+| Check Python + AWS | `python --version` / `aws sts get-caller-identity` | One-time |
+| Enable Bedrock models | AWS Console | One-time |
+| Create S3 bucket | `aws s3 mb s3://mcp-raw-docs` | One-time |
+| Install deps | `pip install -r requirements.txt` | One-time |
+| Create `.env` | `copy .env.example .env` | One-time |
+| Start app | `chainlit run chainlit_app.py --port 8080` | Every run |
+| Open browser | `http://localhost:8080` | Every run |
+| Bootstrap index | Chat: `rebuild index from S3` | Only if existing S3 data |
+
+---
 
 ## Project Structure
 
 ```
 mcp/
 ├── mcp_server/
-│   ├── server.py              # FastMCP server – registers all 5 tools
-│   ├── tool1_document.py      # Upload, parse, embed, summarize
-│   ├── tool2_rag_search.py    # RAG search via Bedrock Knowledge Base
-│   └── tool3_doc_storage.py   # Vector store: store & search pages
+│   ├── server.py              # FastMCP server – 6 registered tools (stdio)
+│   ├── tool1_document.py      # Upload + MarkItDown parse + FAISS embed + Claude summary
+│   ├── tool2_rag_search.py    # FAISS RAG search + Claude answer + S3 bootstrap
+│   ├── tool3_doc_storage.py   # FAISS page search, list docs, get chunks
+│   └── utils.py               # Shared: AWS clients, MarkItDown, FAISS, embedder, chunker
 ├── agent/
-│   └── agent.py               # LangGraph agent with MultiServerMCPClient
+│   └── agent.py               # Standalone LangGraph agent (alternative entry point)
 ├── infra/
 │   ├── app.py                 # CDK app entry point
-│   ├── cdk.json               # CDK configuration
-│   ├── requirements-cdk.txt   # CDK dependencies
-│   └── stacks/
-│       └── mcp_stack.py       # Full AWS stack definition
+│   └── stacks/mcp_stack.py    # AWS CDK stack (S3, OpenSearch, Bedrock KB, IAM)
+├── chainlit_app.py            # Chainlit UI – main entry point for local testing
+├── local_architecture.txt     # Detailed local architecture diagram
+├── HLD.txt                    # High-level design diagram
 ├── test_tools.py              # Unit + integration tests
 ├── requirements.txt           # Python dependencies
 └── .env.example               # Environment variable template
 ```
 
+---
+
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `AWS_REGION` | AWS region (default: `us-east-1`) |
-| `S3_RAW_BUCKET` | S3 bucket name for raw documents |
-| `OPENSEARCH_ENDPOINT` | OpenSearch Serverless collection host |
-| `OPENSEARCH_INDEX` | Index name (default: `mcp-documents`) |
-| `KNOWLEDGE_BASE_ID` | Bedrock Knowledge Base ID |
-| `LLM_MODEL_ID` | Bedrock LLM model ID |
-| `EMBED_MODEL_ID` | Bedrock embedding model ID |
-| `CHUNK_SIZE` | Text chunk size in tokens (default: `1000`) |
-| `CHUNK_OVERLAP` | Chunk overlap in tokens (default: `200`) |
-| `RAG_TOP_K` | Chunks to retrieve for RAG (default: `5`) |
-| `SEARCH_TOP_K` | Chunks to return for page search (default: `5`) |
+| Variable | Description | Default |
+|---|---|---|
+| `AWS_REGION` | AWS region | `us-east-1` |
+| `S3_BUCKET` | S3 bucket for raw documents | `mcp-raw-docs` |
+| `S3_DOCS_PREFIX` | S3 key prefix for documents | `documents/` |
+| `FAISS_INDEX_DIR` | Local directory for FAISS index | `./faiss_index` |
+| `LLM_MODEL_ID` | Bedrock LLM model ID | `anthropic.claude-3-5-sonnet-20241022-v2:0` |
+| `EMBED_MODEL_ID` | Bedrock embedding model ID | `amazon.titan-embed-text-v2:0` |
+| `CHUNK_SIZE` | Text chunk size in characters | `800` |
+| `CHUNK_OVERLAP` | Chunk overlap in characters | `150` |
+| `RAG_TOP_K` | Chunks to retrieve for RAG | `5` |
