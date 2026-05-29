@@ -81,20 +81,26 @@ def parse_with_markitdown(file_bytes: bytes, filename: str) -> str:
     Parse any supported file (PDF, DOCX, PPTX, XLSX, HTML, TXT, MD, images)
     to clean Markdown text using Microsoft MarkItDown.
 
+    Uses convert_local() – the narrowest safe API for local files per the
+    MarkItDown security guidelines (https://github.com/microsoft/markitdown).
+
     Returns the full markdown string.
     """
     from markitdown import MarkItDown
 
-    md = MarkItDown()
+    # enable_plugins=False is explicit – no 3rd-party plugins loaded
+    md = MarkItDown(enable_plugins=False)
 
-    # Write to a temp file – MarkItDown works from file paths
+    # Write to a temp file – MarkItDown operates on file paths
     suffix = Path(filename).suffix or ".bin"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        result = md.convert(tmp_path)
+        # convert_local() is preferred over convert() for local files:
+        # it restricts access to the local filesystem only (safer in server context)
+        result = md.convert_local(tmp_path)
         return result.text_content
     finally:
         os.unlink(tmp_path)
